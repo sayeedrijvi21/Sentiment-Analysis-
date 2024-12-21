@@ -1,0 +1,180 @@
+import os
+import re
+import string
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras import Sequential
+from tensorflow.keras.layers import (Dense, Dropout, Input, Embedding, LSTM, Bidirectional, 
+                                     GlobalMaxPooling1D, GlobalAveragePooling2D)
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.utils import plot_model
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint, TensorBoard
+from tensorflow.keras.layers.experimental.preprocessing import TextVectorization, Rescaling, RandomFlip, RandomRotation
+
+# Load dataset
+df = pd.read_csv('../input/memotion-dataset-7k/memotion_dataset_7k/labels.csv')
+df.drop(df.columns[df.columns.str.contains('unnamed', case=False)], axis=1, inplace=True)
+df = df.replace({
+    'overall_sentiment': {'very_negative': 0, 'negative': 1, 'neutral': 2, 'positive': 3, 'very_positive': 4}
+})
+df.dropna(inplace=True)
+
+# Text Standardization
+def standardize_text(data):
+    data = data.apply(lambda x: x.lower())
+    data = data.apply(lambda x: re.sub(r'\d+', '', x))
+    data = data.apply(lambda x: re.sub(r'.com', '', x, flags=re.MULTILINE))
+    data = data.apply(lambda x: x.translate(str.maketrans('', '', string.punctuation)))
+    return data
+
+df['text_corrected'] = standardize_text(df.text_corrected)
+
+# Image Preprocessing
+width, height = 100, 100
+X_images = []
+
+for i in tqdm(range(df.shape[0])):
+    path = '../input/memotion-dataset-7k/memotion_dataset_7k/images/' + df.iloc[i]['image_name']
+    img = image.load_img(path, target_size=(width, height, 3))
+    img = image.img_to_array(img) / 255.0
+    X_images.append(img)
+
+X_images = np.array(X_images)
+y = df['overall_sentiment'].values
+
+# Train-Test Split with Stratification
+X_train_images, X_test_images, y_train, y_test, X_train_text, X_test_text = train_test_split(
+    X_images,
+    y,
+    df['text_corrected'].values,
+    test_size=0.2,
+    stratify=y,
+    random_state=42
+)
+
+# Convert to NumPy array for TextVectorization
+X_train_text = np.array(X_train_text)
+X_test_text = np.array(X_test_text)
+
+# Text Vectorization
+vocab_size = 100000
+sequence_length = 50
+vectorize_layer = TextVectorization(max_tokens=vocab_size, output_mode='int', output_sequence_length=sequence_length)
+vectorize_layer.adapt(X_train_text)
+
+# Data Augmentation for Images
+data_augmentation = Sequential([
+    RandomFlip('horizontal'),
+    RandomRotation(0.2),
+])
+
+# Model Definition
+preprocess_input = Rescaling(1./127.5, offset=-1)
+
+# Image Model
+base_model_resnet = ResNet50(input_shape=(width, height, 3), include_top=False, weights='imagenet')
+base_model_resnet.trainable = True
+
+for layer in base_model_resnet.layers[:-50]:  # Fine-tune last 50 layers
+    layer.trainable = False
+
+image_input = Input(shape=(width, height, 3), name='image_input')
+x = data_augmentation(image_input)
+x = preprocess_input(x)
+x = base_model_resnet(x, training=True)
+x = GlobalAveragePooling2D()(x)
+x = Dense(512, activation='relu', kernel_regularizer='l2')(x)
+x = Dropout(0.4)(x)
+
+# Text Model
+text_input = Input(shape=(None,), dtype=tf.string, name='text_input')
+y = vectorize_layer(text_input)
+y = Embedding(vocab_size, 300)(y)  # Increased embedding dimensions
+y = Bidirectional(LSTM(256, return_sequences=True))(y)  # Increased LSTM capacity
+y = GlobalMaxPooling1D()(y)
+y = Dense(128, activation='relu', kernel_regularizer='l2')(y)
+y = Dropout(0.4)(y)
+
+# Concatenate Features
+concatenated = tf.keras.layers.concatenate([x, y])
+z = Dense(512, activation='relu')(concatenated)
+z = Dropout(0.5)(z)
+output = Dense(5, activation='softmax', name='sentiment')(z)
+
+model = Model(inputs=[image_input, text_input], outputs=[output])
+model.compile(optimizer=Adam(learning_rate=0.0005),  # Lower learning rate
+              loss='sparse_categorical_crossentropy',
+              metrics=['accuracy'])
+
+# Class Weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(y_train),
+    y=y_train
+)
+class_weights_dict = {i: weight for i, weight in enumerate(class_weights)}
+
+# Custom TensorBoard Callback to Avoid AttributeError
+class CustomTensorBoard(TensorBoard):
+    def _log_weights(self, epoch):
+        try:
+            super()._log_weights(epoch)
+        except AttributeError:
+            pass
+
+# Callbacks
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.1, patience=5, verbose=1)
+early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+checkpoint = ModelCheckpoint('model_best.tf', save_best_only=True, monitor='val_loss', save_format='tf')
+tensorboard = CustomTensorBoard(log_dir='./logs', histogram_freq=1)
+
+# Model Summary
+model.summary()
+plot_model(model, show_shapes=True)
+
+# Training with Class Weights
+history = model.fit(
+    x={"image_input": X_train_images, "text_input": X_train_text},
+    y=y_train,
+    validation_split=0.2,
+    epochs=50,  # Increased epochs
+    batch_size=32,  # Moderate batch size
+    verbose=1,
+    class_weight=class_weights_dict,
+    callbacks=[reduce_lr, early_stop, checkpoint, tensorboard]
+)
+
+# Evaluation
+results = model.evaluate(
+    x={"image_input": X_test_images, "text_input": X_test_text},
+    y=y_test,
+    batch_size=32,
+    verbose=1
+)
+print("Test Accuracy:", results[1])
+
+# Visualization of Results
+class_names = ['Very Negative', 'Negative', 'Neutral', 'Positive', 'Very Positive']
+
+def visualize_predictions(images, texts, labels, predictions, class_names):
+    plt.figure(figsize=(15, 15))
+    for i in range(min(len(images), 9)):
+        plt.subplot(3, 3, i + 1)
+        plt.imshow(images[i])
+        pred_class = class_names[np.argmax(predictions[i])]
+        true_class = class_names[labels[i]]
+        plt.title(f"Pred: {pred_class}\nTrue: {true_class}")
+        plt.axis('off')
+    plt.show()
+
+# Predict and Visualize
+predictions = model.predict({"image_input": X_test_images[:9], "text_input": X_test_text[:9]})
+visualize_predictions(X_test_images[:9], X_test_text[:9], y_test[:9], predictions, class_names=class_names)
